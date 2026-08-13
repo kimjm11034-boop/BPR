@@ -7,6 +7,7 @@ import { App as CapacitorApp } from '@capacitor/app';
 import { DEMO_PLAYERS, type Match, type Player, personalRankings, partnerRankings } from '@/lib/demo-data';
 import { readRegisteredPlayers, readTodayMatches, shouldResetStoredData } from '@/lib/domain/session';
 import { createSupabaseBrowserClient } from '@/lib/supabase/browser';
+import { readAuthCode } from '@/lib/supabase/deep-link';
 import { readCloudState, recordCloudMatch, registerCloudPlayer, setCloudPlayerActive } from '@/lib/supabase/sync';
 
 type View = 'home' | 'input' | 'records' | 'rankings';
@@ -90,12 +91,12 @@ export default function HomePage() {
     };
     supabase.auth.getSession().then(({ data }) => hydrateCloud(data.session));
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => { void hydrateCloud(session); });
-    const deepLink = CapacitorApp.addListener('appUrlOpen', ({ url }) => {
-      if (!url.startsWith('bpr://auth-callback')) return;
-      const callbackUrl = new URL(url);
-      const code = callbackUrl.searchParams.get('code');
+    const handleDeepLink = (url: string | null | undefined) => {
+      const code = readAuthCode(url);
       if (code) void supabase.auth.exchangeCodeForSession(code);
-    });
+    };
+    void CapacitorApp.getLaunchUrl().then((launch) => handleDeepLink(launch?.url));
+    const deepLink = CapacitorApp.addListener('appUrlOpen', ({ url }) => handleDeepLink(url));
     return () => { active = false; listener.subscription.unsubscribe(); void deepLink.then((handle) => handle.remove()); };
   }, []);
 
