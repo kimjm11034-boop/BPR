@@ -1,19 +1,20 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { CalendarDays, ChevronRight, ClipboardList, Home, Pencil, Plus, RotateCcw, Trash2, Trophy, UserPlus } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CalendarDays, CheckCircle2, ChevronRight, ClipboardList, CloudUpload, Home, Pencil, Plus, RotateCcw, Settings, Trash2, Trophy, UserPlus, WifiOff } from 'lucide-react';
 import type { Session } from '@supabase/supabase-js';
 import { App as CapacitorApp } from '@capacitor/app';
+import { Capacitor } from '@capacitor/core';
 import { DEMO_PLAYERS, type Match, type Player, personalRankings, partnerRankings } from '@/lib/demo-data';
-import { readRegisteredPlayers, readTodayMatches, shouldResetStoredData } from '@/lib/domain/session';
+import { cancelLocalMatch, loadLocalStore, LOCAL_SCHEMA_VERSION, saveLocalStore, type LocalStoreState } from '@/lib/domain/local-store';
 import { createSupabaseBrowserClient } from '@/lib/supabase/browser';
-import { readAuthCode } from '@/lib/supabase/deep-link';
-import { readCloudState, recordCloudMatch, registerCloudPlayer, setCloudPlayerActive } from '@/lib/supabase/sync';
+import { readAuthCallback } from '@/lib/supabase/deep-link';
+import { cancelCloudMatch, readCloudState, recordCloudMatch, registerCloudPlayer, setCloudPlayerActive, syncLocalSnapshot } from '@/lib/supabase/sync';
 
-type View = 'home' | 'input' | 'records' | 'rankings';
+type View = 'home' | 'input' | 'records' | 'rankings' | 'settings';
+type SyncState = 'idle' | 'waiting' | 'syncing' | 'success' | 'error';
 
 const fmtRate = (value: number) => `${Math.round(value * 1000) / 10}%`;
-const DATA_VERSION = 'bpr-clean-slate-v1';
 const localDateInput = () => {
   const date = new Date();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -25,6 +26,7 @@ const formatSessionTitle = (date: string) => {
   return month && day ? `${Number(month)}월 ${Number(day)}일 경기` : '오늘 경기';
 };
 const supabase = createSupabaseBrowserClient();
+const isNative = Capacitor.isNativePlatform();
 
 export default function HomePage() {
   const [view, setView] = useState<View>('home');
@@ -32,42 +34,62 @@ export default function HomePage() {
   const [calendarDate, setCalendarDate] = useState(localDateInput);
   const [hydrated, setHydrated] = useState(false);
   const [players, setPlayers] = useState<Player[]>(DEMO_PLAYERS);
+  const [inactivePlayerIds, setInactivePlayerIds] = useState<string[]>([]);
+  const [cancelledMatchIds, setCancelledMatchIds] = useState<string[]>([]);
+  const [deviceId, setDeviceId] = useState('');
   const [newPlayerName, setNewPlayerName] = useState('');
   const [matches, setMatches] = useState<Match[]>([]);
   const [todayMatches, setTodayMatches] = useState<Match[]>([]);
   const [selected, setSelected] = useState<[string, string, string, string]>(['', '', '', '']);
   const [winner, setWinner] = useState<'A' | 'B'>('A');
   const [rankingTab, setRankingTab] = useState<'personal' | 'partner'>('personal');
-  const [authReady, setAuthReady] = useState(!supabase);
+  const [authReady, setAuthReady] = useState(!supabase || isNative);
   const [authSession, setAuthSession] = useState<Session | null>(null);
   const [syncError, setSyncError] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [syncEmail, setSyncEmail] = useState('');
+  const [syncState, setSyncState] = useState<SyncState>('idle');
+  const [lastSyncAt, setLastSyncAt] = useState('');
+  const pendingSyncRef = useRef(false);
+  const localSnapshotRef = useRef<LocalStoreState>({ schemaVersion: LOCAL_SCHEMA_VERSION, deviceId: '', players: DEMO_PLAYERS, inactivePlayerIds: [], matches: [], todayMatches: [], cancelledMatchIds: [], updatedAt: new Date().toISOString() });
+  localSnapshotRef.current = { schemaVersion: LOCAL_SCHEMA_VERSION, deviceId, players, inactivePlayerIds, matches, todayMatches, cancelledMatchIds, updatedAt: new Date().toISOString() };
   const rankings = useMemo(() => personalRankings(players, matches), [matches, players]);
   const partners = useMemo(() => partnerRankings(players, matches), [matches, players]);
   const sessionTitle = formatSessionTitle(sessionDate);
+  const runManualSync = async (session: Session) => {
+    if (!supabase) return;
+    setSyncState('syncing');
+    setSyncError('');
+    const hasStoredSnapshot = window.localStorage.getItem('bpr-local-store') !== null || window.localStorage.getItem('badminton-matchbook-players') !== null;
+    const storedSnapshot = loadLocalStore(window.localStorage, localDateInput());
+    const result = await syncLocalSnapshot(supabase, hasStoredSnapshot ? storedSnapshot : localSnapshotRef.current);
+    setAuthSession(session);
+    pendingSyncRef.current = false;
+    window.localStorage.removeItem('bpr-pending-sync');
+    if (result.failed.length) {
+      setSyncState('error');
+      setSyncError(`${result.failed.length}개 항목을 동기화하지 못했어요. 설정에서 다시 시도해 주세요.`);
+      return;
+    }
+    const syncedAt = new Date().toISOString();
+    window.localStorage.setItem('bpr-last-sync-at', syncedAt);
+    setLastSyncAt(syncedAt);
+    setSyncState('success');
+  };
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      const storedVersion = window.localStorage.getItem('bpr-data-version');
-      const resetStoredData = shouldResetStoredData(storedVersion, DATA_VERSION);
-      const savedMatches = resetStoredData ? null : window.localStorage.getItem('badminton-matchbook-matches');
-      let nextMatches: Match[] = [];
-      if (savedMatches) {
-        try { nextMatches = JSON.parse(savedMatches) as Match[]; } catch { nextMatches = []; }
-      }
-      const savedPlayers = window.localStorage.getItem('badminton-matchbook-players');
-      const restoredPlayers = readRegisteredPlayers(savedPlayers, window.localStorage.getItem('badminton-matchbook-session'));
-      const nextPlayers = savedPlayers !== null || restoredPlayers.length ? restoredPlayers : DEMO_PLAYERS;
       const date = localDateInput();
-      const savedToday = resetStoredData ? null : window.localStorage.getItem('badminton-matchbook-today');
-      const nextTodayMatches = savedToday ? readTodayMatches(savedToday, date) : nextMatches.filter((match) => match.playedAt.slice(0, 10) === date);
-      if (resetStoredData) {
-        window.localStorage.removeItem('badminton-matchbook-matches');
-        window.localStorage.removeItem('badminton-matchbook-today');
-        window.localStorage.setItem('bpr-data-version', DATA_VERSION);
-      }
-      setMatches(nextMatches);
-      setPlayers(nextPlayers);
-      setTodayMatches(nextTodayMatches);
+      const stored = loadLocalStore(window.localStorage, date);
+      const hasStoredRoster = window.localStorage.getItem('bpr-local-store') !== null || window.localStorage.getItem('badminton-matchbook-players') !== null;
+      setDeviceId(stored.deviceId);
+      setMatches(stored.matches);
+      setPlayers(hasStoredRoster ? stored.players : DEMO_PLAYERS);
+      setInactivePlayerIds(stored.inactivePlayerIds);
+      setCancelledMatchIds(stored.cancelledMatchIds);
+      setTodayMatches(stored.todayMatches.length ? stored.todayMatches : stored.matches.filter((match) => match.playedAt.slice(0, 10) === date));
+      setLastSyncAt(window.localStorage.getItem('bpr-last-sync-at') ?? '');
+      pendingSyncRef.current = isNative && window.localStorage.getItem('bpr-pending-sync') === '1';
       setHydrated(true);
     }, 0);
     return () => window.clearTimeout(timer);
@@ -79,7 +101,7 @@ export default function HomePage() {
     const hydrateCloud = async (session: Session | null) => {
       if (!active) return;
       setAuthSession(session);
-      if (session) {
+      if (session && !isNative && !pendingSyncRef.current) {
         const cloud = await readCloudState(supabase);
         if (active && cloud) {
           setPlayers(cloud.players);
@@ -89,19 +111,37 @@ export default function HomePage() {
       }
       if (active) setAuthReady(true);
     };
-    supabase.auth.getSession().then(({ data }) => hydrateCloud(data.session));
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => { void hydrateCloud(session); });
-    const handleDeepLink = (url: string | null | undefined) => {
-      const code = readAuthCode(url);
-      if (code) void supabase.auth.exchangeCodeForSession(code);
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (isNative && session && pendingSyncRef.current) void runManualSync(session);
+      else void hydrateCloud(session);
+    });
+    if (!isNative) supabase.auth.getSession().then(({ data }) => hydrateCloud(data.session));
+    const handleDeepLink = async (url: string | null | undefined) => {
+      if (!isNative) return;
+      const callback = readAuthCallback(url);
+      if (!callback.code && !(callback.accessToken && callback.refreshToken)) return;
+      try {
+        const result = callback.code
+          ? await supabase.auth.exchangeCodeForSession(callback.code)
+          : await supabase.auth.setSession({ access_token: callback.accessToken!, refresh_token: callback.refreshToken! });
+        if (result.error) throw result.error;
+        if (result.data.session && pendingSyncRef.current) await runManualSync(result.data.session);
+      } catch {
+        pendingSyncRef.current = false;
+        window.localStorage.removeItem('bpr-pending-sync');
+        setSyncState('error');
+        setSyncError('로그인 링크를 처리하지 못했어요. 설정에서 새 동기화를 시작해 주세요.');
+      }
     };
-    void CapacitorApp.getLaunchUrl().then((launch) => handleDeepLink(launch?.url));
-    const deepLink = CapacitorApp.addListener('appUrlOpen', ({ url }) => handleDeepLink(url));
-    return () => { active = false; listener.subscription.unsubscribe(); void deepLink.then((handle) => handle.remove()); };
+    if (isNative) {
+      void CapacitorApp.getLaunchUrl().then((launch) => handleDeepLink(launch?.url));
+    }
+    const deepLink = isNative ? CapacitorApp.addListener('appUrlOpen', ({ url }) => { void handleDeepLink(url); }) : null;
+    return () => { active = false; listener.subscription.unsubscribe(); if (deepLink) void deepLink.then((handle) => handle.remove()); };
   }, []);
 
   useEffect(() => {
-    if (!supabase || !authSession) return;
+    if (!supabase || !authSession || isNative) return;
     const refresh = async () => {
       const cloud = await readCloudState(supabase);
       if (!cloud) return;
@@ -119,13 +159,8 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!hydrated) return;
-    window.localStorage.setItem('badminton-matchbook-matches', JSON.stringify(matches));
-  }, [hydrated, matches]);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    window.localStorage.setItem('badminton-matchbook-players', JSON.stringify(players));
-  }, [hydrated, players]);
+    saveLocalStore(window.localStorage, localSnapshotRef.current);
+  }, [hydrated, players, inactivePlayerIds, matches, todayMatches, cancelledMatchIds, deviceId]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -153,7 +188,7 @@ export default function HomePage() {
     if (selected.some((id) => !id) || new Set(selected).size !== 4) return;
     const player = (id: string) => players.find((item) => item.id === id)!;
     const match: Match = { id: crypto.randomUUID(), playedAt: `${sessionDate}T${new Date().toISOString().slice(11)}`, teamA: [player(selected[0]), player(selected[1])], teamB: [player(selected[2]), player(selected[3])], winner };
-    if (supabase && authSession && !(await recordCloudMatch(supabase, match, todayMatches.length + 1))) { setSyncError('클라우드 저장에 실패했어요. 잠시 후 다시 시도해 주세요.'); return; }
+    if (!isNative && supabase && authSession && !(await recordCloudMatch(supabase, match, todayMatches.length + 1))) { setSyncError('클라우드 저장에 실패했어요. 잠시 후 다시 시도해 주세요.'); return; }
     setSyncError('');
     setMatches((previous) => [...previous, match]);
     setTodayMatches((previous) => [...previous, match]);
@@ -164,7 +199,7 @@ export default function HomePage() {
 
   const openMatchInput = () => {
     if (!sessionDate) return;
-    const nextTodayMatches = readTodayMatches(window.localStorage.getItem('badminton-matchbook-today'), sessionDate);
+    const nextTodayMatches = loadLocalStore(window.localStorage, sessionDate).todayMatches;
     setTodayMatches(nextTodayMatches);
     setSelected(['', '', '', '']);
     window.localStorage.setItem('badminton-matchbook-session', JSON.stringify({ date: sessionDate, players }));
@@ -176,21 +211,62 @@ export default function HomePage() {
     window.localStorage.setItem('badminton-matchbook-today', JSON.stringify({ date: sessionDate, matches: [] }));
   };
 
+  const removeMatch = async (match: Match) => {
+    if (!window.confirm('이 경기 기록을 삭제할까요? 삭제하면 누적 순위와 파트너 전적에서도 제외됩니다.')) return;
+    if (!isNative && supabase && authSession && !(await cancelCloudMatch(supabase, match.id))) {
+      setSyncError('경기 기록 삭제에 실패했어요. 잠시 후 다시 시도해 주세요.');
+      return;
+    }
+    const next = cancelLocalMatch(localSnapshotRef.current, match.id);
+    setMatches(next.matches);
+    setTodayMatches(next.todayMatches);
+    setCancelledMatchIds(next.cancelledMatchIds);
+    setSyncError('');
+  };
+
   const addPlayer = async () => {
     const displayName = newPlayerName.trim();
     if (!displayName) return;
     const player = { id: crypto.randomUUID(), displayName };
-    if (supabase && authSession && !(await registerCloudPlayer(supabase, player))) { setSyncError('선수 등록에 실패했어요. 잠시 후 다시 시도해 주세요.'); return; }
+    if (!isNative && supabase && authSession && !(await registerCloudPlayer(supabase, player))) { setSyncError('클라우드 저장에 실패했어요. 잠시 후 다시 시도해 주세요.'); return; }
     setSyncError('');
     setPlayers((current) => [...current, player]);
     setNewPlayerName('');
   };
 
   const removePlayer = async (id: string) => {
-    if (supabase && authSession && !(await setCloudPlayerActive(supabase, id, false))) { setSyncError('선수 상태 변경에 실패했어요. 잠시 후 다시 시도해 주세요.'); return; }
+    if (!isNative && supabase && authSession && !(await setCloudPlayerActive(supabase, id, false))) { setSyncError('클라우드 저장에 실패했어요. 잠시 후 다시 시도해 주세요.'); return; }
     setSyncError('');
     setPlayers((current) => current.filter((player) => player.id !== id));
+    setInactivePlayerIds((current) => [...new Set([...current, id])]);
     setSelected((current) => current.map((selectedId) => selectedId === id ? '' : selectedId) as typeof current);
+  };
+
+  const startManualSync = async () => {
+    if (!supabase) return;
+    setSyncError('');
+    const { data } = await supabase.auth.getSession();
+    if (data.session) {
+      await runManualSync(data.session);
+      return;
+    }
+    if (!isNative) return;
+    const email = syncEmail.trim();
+    if (!email) {
+      setSyncState('error');
+      setSyncError('컴퓨터에서 사용할 이메일을 입력해 주세요.');
+      return;
+    }
+    pendingSyncRef.current = true;
+    window.localStorage.setItem('bpr-pending-sync', '1');
+    setSyncState('waiting');
+    const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: 'bpr://auth-callback' } });
+    if (error) {
+      pendingSyncRef.current = false;
+      window.localStorage.removeItem('bpr-pending-sync');
+      setSyncState('error');
+      setSyncError(error.message);
+    }
   };
 
   const startNewMatch = () => {
@@ -199,10 +275,10 @@ export default function HomePage() {
     setView('input');
   };
 
-  const sectionTitle = view === 'home' ? '경기 준비' : view === 'input' ? sessionTitle : view === 'records' ? '전체 경기 기록' : '전체 누적 순위';
+  const sectionTitle = view === 'home' ? '경기 준비' : view === 'input' ? sessionTitle : view === 'records' ? '전체 경기 기록' : view === 'rankings' ? '전체 누적 순위' : '설정';
 
-  if (supabase && !authReady) return <AuthLoading />;
-  if (supabase && !authSession) return <AuthGate />;
+  if (!isNative && supabase && !authReady) return <AuthLoading />;
+  if (!isNative && supabase && !authSession) return <AuthGate authError={authError} />;
 
   return (
     <main className="app-shell">
@@ -214,7 +290,8 @@ export default function HomePage() {
             <h1>{sectionTitle}</h1>
           </div>
           <div className="topbar-actions">
-            {authSession && <button className="auth-user-pill" type="button" onClick={() => { void supabase?.auth.signOut(); }}>{authSession.user.email} · 로그아웃</button>}
+            {!isNative && authSession && <button className="auth-user-pill" type="button" onClick={() => { void supabase?.auth.signOut(); }}>{authSession.user.email} · 로그아웃</button>}
+            {isNative && <button className="settings-top-button" type="button" onClick={() => setView('settings')} aria-label="설정"><Settings size={17} /></button>}
             <span className="live-pill"><span /> 실시간</span>
           </div>
         </header>
@@ -259,7 +336,27 @@ export default function HomePage() {
           </>
         )}
 
-        {view === 'records' && <Records matches={matches} emptyText="아직 누적된 경기가 없습니다." />}
+        {view === 'settings' && (
+          <section className="surface settings-panel">
+            <div className="setup-intro">
+              <span className="section-kicker">DEVICE</span>
+              <h2>기기에서 바로 기록해요</h2>
+              <p>경기 기록은 먼저 이 핸드폰에 저장됩니다. 컴퓨터에서 확인할 때만 동기화하세요.</p>
+            </div>
+            <div className="offline-status"><WifiOff size={17} /><div><strong>기기 저장 모드</strong><small>경기 입력 중에는 인터넷과 이메일을 사용하지 않아요.</small></div></div>
+            <div className="settings-sync-card">
+              <div><span className="section-kicker">SYNC</span><h3>컴퓨터로 기록 보내기</h3><p>{lastSyncAt ? `마지막 동기화: ${new Date(lastSyncAt).toLocaleString('ko-KR')}` : '아직 동기화하지 않았어요.'}</p></div>
+              <CloudUpload size={25} />
+            </div>
+            {syncState === 'waiting' && <p className="auth-success">메일을 확인한 뒤 링크를 누르면 기록 전송이 계속됩니다.</p>}
+            {syncState === 'success' && <p className="auth-success"><CheckCircle2 size={16} /> 기록을 컴퓨터로 보냈어요.</p>}
+            {isNative && !authSession && <label className="form-label" htmlFor="sync-email"><span>컴퓨터에서 사용할 이메일</span><input id="sync-email" type="email" placeholder="name@example.com" value={syncEmail} onChange={(event) => setSyncEmail(event.target.value)} /></label>}
+            <button className="primary-button" type="button" onClick={() => void startManualSync()} disabled={syncState === 'syncing'}><CloudUpload size={18} /> {syncState === 'syncing' ? '기록을 보내는 중...' : '컴퓨터로 기록 보내기'}</button>
+            <p className="settings-note">동기화에 실패해도 핸드폰의 기록은 삭제되지 않습니다. 네트워크가 연결된 뒤 다시 시도할 수 있어요.</p>
+          </section>
+        )}
+
+        {view === 'records' && <Records matches={matches} onDelete={removeMatch} emptyText="아직 누적된 경기가 없습니다." />}
         {view === 'rankings' && (
           <section className="surface ranking-panel">
             <div className="segmented"><button className={rankingTab === 'personal' ? 'selected' : ''} onClick={() => setRankingTab('personal')}>개인 순위</button><button className={rankingTab === 'partner' ? 'selected' : ''} onClick={() => setRankingTab('partner')}>파트너 조합</button></div>
@@ -275,6 +372,7 @@ export default function HomePage() {
         <NavButton label="경기입력" icon={<Pencil size={21} />} active={view === 'input'} onClick={openMatchInput} />
         <NavButton label="전체기록" icon={<ClipboardList size={21} />} active={view === 'records'} onClick={() => setView('records')} />
         <NavButton label="순위표" icon={<Trophy size={21} />} active={view === 'rankings'} onClick={() => setView('rankings')} />
+        <NavButton label="설정" icon={<Settings size={21} />} active={view === 'settings'} onClick={() => setView('settings')} />
       </nav>
     </main>
   );
@@ -284,7 +382,7 @@ function AuthLoading() {
   return <main className="auth-shell"><section className="surface auth-card"><span className="section-kicker">BPR · SECURE</span><h1>연결 중이에요</h1><p>Supabase 계정을 확인하고 있습니다.</p></section></main>;
 }
 
-function AuthGate() {
+function AuthGate({ authError = '' }: { authError?: string }) {
   const [email, setEmail] = useState('');
   const [sent, setSent] = useState(false);
   const [error, setError] = useState('');
@@ -292,12 +390,12 @@ function AuthGate() {
     const address = email.trim();
     if (!address || !supabase) return;
     setError('');
-    const redirectTo = window.location.origin.startsWith('https://localhost') ? 'bpr://auth-callback' : window.location.origin;
+    const redirectTo = Capacitor.isNativePlatform() ? 'bpr://auth-callback' : window.location.origin;
     const { error: authError } = await supabase.auth.signInWithOtp({ email: address, options: { emailRedirectTo: redirectTo } });
     if (authError) setError(authError.message);
     else setSent(true);
   };
-  return <main className="auth-shell"><section className="surface auth-card"><span className="section-kicker">BPR · SECURE</span><h1>운영자 로그인</h1><p>경기 기록을 여러 기기에서 안전하게 공유하려면 이메일 로그인이 필요해요.</p>{sent ? <div className="auth-success">메일을 확인해 로그인 링크를 눌러 주세요.</div> : <><label className="form-label" htmlFor="operator-email"><span>운영자 이메일</span><input id="operator-email" type="email" placeholder="name@example.com" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void sendMagicLink(); }} /></label><button className="primary-button" type="button" disabled={!email.trim()} onClick={() => void sendMagicLink()}>로그인 링크 보내기</button></>}{error && <p className="sync-error" role="alert">{error}</p>}</section></main>;
+  return <main className="auth-shell"><section className="surface auth-card"><span className="section-kicker">BPR · SECURE</span><h1>운영자 로그인</h1><p>경기 기록을 여러 기기에서 안전하게 공유하려면 이메일 로그인이 필요해요.</p>{authError && <p className="sync-error" role="alert">{authError}</p>}{sent ? <div className="auth-success">메일을 확인해 로그인 링크를 눌러 주세요.</div> : <><label className="form-label" htmlFor="operator-email"><span>운영자 이메일</span><input id="operator-email" type="email" placeholder="name@example.com" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void sendMagicLink(); }} /></label><button className="primary-button" type="button" disabled={!email.trim()} onClick={() => void sendMagicLink()}>로그인 링크 보내기</button></>}{error && <p className="sync-error" role="alert">{error}</p>}</section></main>;
 }
 
 function TeamPicker({ label, players, values, indexOffset, selected, onChange }: { label: string; players: Player[]; values: string[]; indexOffset: number; selected: string[]; onChange: (index: number, id: string) => void }) {
@@ -316,14 +414,14 @@ function RegisteredPlayerList({ rows, fmtRate, onRemove }: { rows: ReturnType<ty
   return <div className="registered-list">{rows.map((row, index) => <div className="registered-player-row" key={row.player.id}><span className={`rank-medal medal-${index + 1}`}>{index + 1}</span><div className="rank-name"><strong>{playerLabel(row.player, rosterPlayers)}</strong><small>{row.games}경기 · {row.wins}승 {row.losses}패</small></div><b className="rank-rate">{fmtRate(row.winRate)}</b><button type="button" aria-label={`${row.player.displayName} 선수 삭제`} onClick={() => onRemove(row.player.id)}><Trash2 size={15} /></button></div>)}</div>;
 }
 
-function Records({ matches, compact = false, emptyText = '기록이 없습니다.' }: { matches: Match[]; compact?: boolean; emptyText?: string }) {
+function Records({ matches, compact = false, onDelete, emptyText = '기록이 없습니다.' }: { matches: Match[]; compact?: boolean; onDelete?: (match: Match) => void; emptyText?: string }) {
   if (!matches.length) return <div className="records-empty">{emptyText}</div>;
-  return <div className={compact ? 'records compact' : 'records'}>{matches.slice().reverse().map((match, index) => <MatchRow key={match.id} match={match} number={matches.length - index} />)}</div>;
+  return <div className={compact ? 'records compact' : 'records'}>{matches.slice().reverse().map((match, index) => <MatchRow key={match.id} match={match} number={matches.length - index} onDelete={onDelete} />)}</div>;
 }
 
-function MatchRow({ match, number }: { match: Match; number: number }) {
+function MatchRow({ match, number, onDelete }: { match: Match; number: number; onDelete?: (match: Match) => void }) {
   const aWon = match.winner === 'A';
-  return <article className="match-row"><span className="match-number">{number}</span><div className={aWon ? 'side won' : 'side'}>{aWon && <b className="win-badge">승</b>}{match.teamA.map((player) => <span key={player.id}>{player.displayName}</span>)}</div><span className="row-vs">VS</span><div className={!aWon ? 'side won' : 'side'}>{!aWon && <b className="win-badge">승</b>}{match.teamB.map((player) => <span key={player.id}>{player.displayName}</span>)}</div></article>;
+  return <article className="match-row"><span className="match-number">{number}</span><div className={aWon ? 'side won' : 'side'}>{aWon && <b className="win-badge">승</b>}{match.teamA.map((player) => <span key={player.id}>{player.displayName}</span>)}</div><span className="row-vs">VS</span><div className={!aWon ? 'side won' : 'side'}>{!aWon && <b className="win-badge">승</b>}{match.teamB.map((player) => <span key={player.id}>{player.displayName}</span>)}</div>{onDelete && <button className="match-delete-button" type="button" onClick={() => onDelete(match)} aria-label="경기 기록 삭제"><Trash2 size={15} /></button>}</article>;
 }
 
 function PersonalTable({ rows, fmtRate }: { rows: ReturnType<typeof personalRankings>; fmtRate: (value: number) => string }) {
