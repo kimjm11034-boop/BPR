@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { CalendarDays, ChevronRight, ClipboardList, Home, Pencil, Plus, RotateCcw, Trash2, Trophy, UserPlus } from 'lucide-react';
 import type { Session } from '@supabase/supabase-js';
+import { App as CapacitorApp } from '@capacitor/app';
 import { DEMO_PLAYERS, type Match, type Player, personalRankings, partnerRankings } from '@/lib/demo-data';
 import { readRegisteredPlayers, readTodayMatches, shouldResetStoredData } from '@/lib/domain/session';
 import { createSupabaseBrowserClient } from '@/lib/supabase/browser';
@@ -89,7 +90,13 @@ export default function HomePage() {
     };
     supabase.auth.getSession().then(({ data }) => hydrateCloud(data.session));
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => { void hydrateCloud(session); });
-    return () => { active = false; listener.subscription.unsubscribe(); };
+    const deepLink = CapacitorApp.addListener('appUrlOpen', ({ url }) => {
+      if (!url.startsWith('bpr://auth-callback')) return;
+      const callbackUrl = new URL(url);
+      const code = callbackUrl.searchParams.get('code');
+      if (code) void supabase.auth.exchangeCodeForSession(code);
+    });
+    return () => { active = false; listener.subscription.unsubscribe(); void deepLink.then((handle) => handle.remove()); };
   }, []);
 
   useEffect(() => {
@@ -284,7 +291,8 @@ function AuthGate() {
     const address = email.trim();
     if (!address || !supabase) return;
     setError('');
-    const { error: authError } = await supabase.auth.signInWithOtp({ email: address, options: { emailRedirectTo: window.location.origin } });
+    const redirectTo = window.location.origin.startsWith('https://localhost') ? 'bpr://auth-callback' : window.location.origin;
+    const { error: authError } = await supabase.auth.signInWithOtp({ email: address, options: { emailRedirectTo: redirectTo } });
     if (authError) setError(authError.message);
     else setSent(true);
   };
